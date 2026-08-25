@@ -69,8 +69,11 @@ public sealed class MainForm : Form
                 "常见场景（手机截图拼长图）远达不到上述限制，可放心使用。",
                 "尺寸限制说明", MessageBoxButtons.OK, MessageBoxIcon.Information)));
         miHelp.DropDownItems.Add(new ToolStripMenuItem("关于(&A)", null, (_, _) =>
-            MessageBox.Show(this, "X图片拼接 v1.0\n\n支持横向/竖向拼接多张图片，可限制输出体积。", "关于",
-                MessageBoxButtons.OK, MessageBoxIcon.Information)));
+            MessageBox.Show(this,
+                "X图片拼接 v1.0.1\n\n" +
+                "支持横向/竖向拼接多张图片，可限制输出体积。\n\n" +
+                "开发者：明灯花月夜\n网址：mdhyy.cn",
+                "关于", MessageBoxButtons.OK, MessageBoxIcon.Information)));
         _menu.Items.AddRange(new ToolStripItem[] { miFile, miHelp });
         MainMenuStrip = _menu;
 
