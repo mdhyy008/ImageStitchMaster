@@ -1,4 +1,6 @@
 using System.Drawing;
+using System.Numerics;
+using System.Runtime.InteropServices;
 
 namespace ImageStitchMaster;
 
@@ -15,6 +17,7 @@ public sealed class MainForm : Form
     private readonly RadioButton _rbVertical = new();
     private readonly RadioButton _rbHorizontal = new();
     private readonly TextBox _txtLimit = new();
+    private readonly ComboBox _cbxMode = new();
     private readonly SplitContainer _split = new();
     private readonly ListView _listView = new();
     private readonly ImageList _thumbList = new();
@@ -22,13 +25,19 @@ public sealed class MainForm : Form
     private readonly Button _btnDown = new();
     private readonly Button _btnRemove = new();
     private readonly Button _btnClear = new();
-    private readonly PictureBox _picPreview = new();
+    private readonly ZoomablePictureBox _picPreview = new();
     private readonly Label _lblHint = new();
     private readonly ToolStripStatusLabel _lblStatus = new();
     private readonly ToolStripProgressBar _progress = new();
+    private readonly ToolStripStatusLabel _lblCpu = new();
+    private readonly ToolStripStatusLabel _lblMem = new();
+    private readonly System.Windows.Forms.Timer _memTimer = new();
 
     private int _refreshVersion;
     private Task _renderTask = Task.CompletedTask;
+    private bool _previewDragging;
+    private Point _lastMouse;
+    private CancellationTokenSource? _limitCts;
 
     public MainForm()
     {
@@ -106,11 +115,20 @@ public sealed class MainForm : Form
         _rbHorizontal.AutoSize = true;
         grpDir.Controls.AddRange(new Control[] { _rbVertical, _rbHorizontal });
 
+        var lblMode = new Label { Text = "渲染方式：", AutoSize = true, Margin = new Padding(0, 6, 8, 0) };
+        _cbxMode.DropDownStyle = ComboBoxStyle.DropDownList;
+        _cbxMode.Width = 70;
+        _cbxMode.Margin = new Padding(0, 2, 10, 0);
+        _cbxMode.Items.AddRange(new object[] { "普通", "并行" });
+        _cbxMode.SelectedIndex = 0;
+        _cbxMode.SelectedIndexChanged += (_, _) => UpdateModeIndicator();
+
         var lblLimit = new Label { Text = "输出体积上限：", AutoSize = true, Margin = new Padding(0, 5, 8, 0) };
         var lblMb = new Label { Text = "MB（留空不限）", AutoSize = true, Margin = new Padding(0, 5, 0, 0) };
         _txtLimit.Width = 70;
         _txtLimit.TextAlign = HorizontalAlignment.Right;
         _txtLimit.Margin = new Padding(0, 0, 8, 0);
+        _txtLimit.TextChanged += OnLimitTextChanged;
 
         var flowLimit = new FlowLayoutPanel
         {
@@ -121,7 +139,7 @@ public sealed class MainForm : Form
             Location = new Point(500, 18),
             Padding = new Padding(0)
         };
-        flowLimit.Controls.AddRange(new Control[] { lblLimit, _txtLimit, lblMb });
+        flowLimit.Controls.AddRange(new Control[] { lblMode, _cbxMode, lblLimit, _txtLimit, lblMb });
 
         top.Controls.AddRange(new Control[] { _btnAdd, _btnSave, grpDir, flowLimit });
 
@@ -140,15 +158,24 @@ public sealed class MainForm : Form
         _listView.HideSelection = false;
         _listView.MultiSelect = false;
         _listView.SmallImageList = _thumbList;
-        _listView.Columns.Add("#", 40);
+        // 自绘第一列实现「序号在缩略图前面」；开双缓冲消除拖动闪烁
+        _listView.OwnerDraw = true;
+        typeof(ListView).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.SetValue(_listView, true);
+        _listView.DrawColumnHeader += (_, e) => e.DrawDefault = true;
+        _listView.DrawItem += OnListDrawItem;
+        _listView.Columns.Add("#", 90);
         _listView.Columns.Add("文件名", 150);
         _listView.Columns.Add("尺寸", 100);
         // 列宽跟随左面板宽度，文件名/尺寸各占剩余一半
         _listView.Resize += (_, _) => UpdateListColumnWidths();
         _listView.SelectedIndexChanged += (_, _) => UpdateButtons();
         _listView.AllowDrop = true;
-        _listView.DragEnter += OnFileDragEnter;
-        _listView.DragDrop += OnFileDragDrop;
+        _listView.InsertionMark.Color = Color.FromArgb(0, 120, 215);
+        _listView.ItemDrag += OnListItemDrag;
+        _listView.DragEnter += OnListDragEnter;
+        _listView.DragOver += OnListDragOver;
+        _listView.DragDrop += OnListDragDrop;
+        _listView.DragLeave += OnListDragLeave;
 
         var listBtns = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 42, Padding = new Padding(4, 5, 0, 0) };
         foreach (var (btn, text) in new[] { (_btnUp, "上移"), (_btnDown, "下移"), (_btnRemove, "删除"), (_btnClear, "清空") })
@@ -166,8 +193,13 @@ public sealed class MainForm : Form
         _split.Panel1.Controls.Add(listBtns);
 
         _picPreview.Dock = DockStyle.Fill;
-        _picPreview.SizeMode = PictureBoxSizeMode.Zoom;
         _picPreview.BackColor = Color.FromArgb(245, 245, 245);
+        _picPreview.Resize += (_, _) => _picPreview.HandleResize();
+        _picPreview.MouseWheel += OnPreviewMouseWheel;
+        _picPreview.MouseDown += OnPreviewMouseDown;
+        _picPreview.MouseMove += OnPreviewMouseMove;
+        _picPreview.MouseUp += OnPreviewMouseUp;
+        _picPreview.MouseDoubleClick += (_, _) => _picPreview.ResetView();
 
         _lblHint.Dock = DockStyle.Fill;
         _lblHint.TextAlign = ContentAlignment.MiddleCenter;
@@ -190,7 +222,16 @@ public sealed class MainForm : Form
         _lblStatus.TextAlign = ContentAlignment.MiddleLeft;
         _progress.Visible = false;
         _progress.Width = 200;
-        status.Items.AddRange(new ToolStripItem[] { _lblStatus, _progress });
+        _lblCpu.Alignment = ToolStripItemAlignment.Right;
+        _lblCpu.TextAlign = ContentAlignment.MiddleRight;
+        _lblMem.Alignment = ToolStripItemAlignment.Right;
+        _lblMem.TextAlign = ContentAlignment.MiddleRight;
+        status.Items.AddRange(new ToolStripItem[] { _lblStatus, _progress, _lblMem, _lblCpu });
+        UpdateModeIndicator();
+
+        _memTimer.Interval = 1000;
+        _memTimer.Tick += (_, _) => UpdateMemText();
+        _memTimer.Start();
 
         Controls.Add(_split);
         Controls.Add(top);
@@ -233,16 +274,26 @@ public sealed class MainForm : Form
     {
         if (paths.Length == 0) return;
         SetBusy(true, "正在导入图片…");
+        _progress.Visible = true;
+        _progress.Maximum = paths.Length;
+        _progress.Value = 0;
+        IProgress<(int done, int total)> progress = new Progress<(int done, int total)>(p =>
+        {
+            _progress.Value = Math.Min(p.done, _progress.Maximum);
+            _lblStatus.Text = $"正在导入 {p.done}/{p.total}…";
+        });
+
         var loaded = new List<ImageItem>();
         var failed = new List<string>();
         try
         {
             await Task.Run(() =>
             {
-                foreach (var p in paths)
+                for (int i = 0; i < paths.Length; i++)
                 {
-                    try { loaded.Add(ImageItem.Load(p)); }
-                    catch { failed.Add(Path.GetFileName(p)); }
+                    try { loaded.Add(ImageItem.Load(paths[i])); }
+                    catch { failed.Add(Path.GetFileName(paths[i])); }
+                    progress.Report((i + 1, paths.Length));
                 }
             });
             _items.AddRange(loaded);
@@ -251,6 +302,7 @@ public sealed class MainForm : Form
         }
         finally
         {
+            _progress.Visible = false;
             SetBusy(false);
         }
         if (failed.Count > 0)
@@ -269,7 +321,7 @@ public sealed class MainForm : Form
         {
             var it = _items[i];
             _thumbList.Images.Add(it.Thumbnail);
-            var lvi = new ListViewItem((i + 1).ToString()) { ImageIndex = i };
+            var lvi = new ListViewItem((i + 1).ToString()) { ImageIndex = i, Tag = it };
             lvi.SubItems.Add(it.FileName);
             lvi.SubItems.Add($"{it.Width}×{it.Height}");
             _listView.Items.Add(lvi);
@@ -289,6 +341,158 @@ public sealed class MainForm : Form
         _listView.Items[j].Selected = true;
         _listView.EnsureVisible(j);
         RefreshPreview();
+    }
+
+    // ---- 拖放排序 ----
+
+    private void OnListItemDrag(object? sender, ItemDragEventArgs e)
+    {
+        if (e.Item is not ListViewItem item) return;
+        item.Selected = true;
+        _listView.DoDragDrop(item, DragDropEffects.Move);
+    }
+
+    private void OnListDragEnter(object? sender, DragEventArgs e)
+    {
+        if (e.Data?.GetDataPresent(typeof(ListViewItem)) == true)
+            e.Effect = DragDropEffects.Move;
+        else
+            OnFileDragEnter(sender, e);
+    }
+
+    private void OnListDragOver(object? sender, DragEventArgs e)
+    {
+        if (e.Data?.GetDataPresent(typeof(ListViewItem)) == true)
+        {
+            var p = _listView.PointToClient(new Point(e.X, e.Y));
+            var target = _listView.GetItemAt(p.X, p.Y);
+            if (target != null)
+            {
+                bool after = p.Y > target.Bounds.Top + target.Bounds.Height / 2;
+                SetInsertionMark(target.Index, after);
+            }
+            else if (p.Y > _listView.ClientSize.Height - 8)
+            {
+                // 拖到列表底部空白：插到末尾
+                SetInsertionMark(_items.Count - 1, true);
+            }
+            else
+            {
+                SetInsertionMark(-1, false);
+            }
+            e.Effect = DragDropEffects.Move;
+        }
+        else if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
+        {
+            e.Effect = DragDropEffects.Copy;
+        }
+        else
+        {
+            e.Effect = DragDropEffects.None;
+        }
+    }
+
+    private void OnListDragDrop(object? sender, DragEventArgs e)
+    {
+        try
+        {
+            if (e.Data?.GetData(typeof(ListViewItem)) is ListViewItem dragLvi && dragLvi.Tag is ImageItem dragItem)
+            {
+                int from = _items.IndexOf(dragItem);
+                if (from < 0) return;
+
+                var p = _listView.PointToClient(new Point(e.X, e.Y));
+                int to = _items.Count;
+                var target = _listView.GetItemAt(p.X, p.Y);
+                if (target?.Tag is ImageItem targetItem)
+                {
+                    int ti = _items.IndexOf(targetItem);
+                    bool after = p.Y > target.Bounds.Top + target.Bounds.Height / 2;
+                    to = after ? ti + 1 : ti;
+                }
+                if (from < to) to--;
+                if (to < 0) to = 0;
+
+                if (from == to) return;
+
+                _items.RemoveAt(from);
+                _items.Insert(Math.Min(to, _items.Count), dragItem);
+                RefreshList();
+                int sel = Math.Max(0, Math.Min(to, _items.Count - 1));
+                _listView.Items[sel].Selected = true;
+                _listView.EnsureVisible(sel);
+                RefreshPreview();
+            }
+            else
+            {
+                OnFileDragDrop(sender, e);
+            }
+        }
+        finally
+        {
+            ClearInsertionMark();
+        }
+    }
+
+    private void OnListDragLeave(object? sender, EventArgs e) => ClearInsertionMark();
+
+    private void ClearInsertionMark()
+    {
+        _listView.InsertionMark.Index = -1;
+        _listView.InsertionMark.AppearsAfterItem = false;
+        _listView.Invalidate();
+    }
+
+    private void SetInsertionMark(int index, bool after)
+    {
+        if (_listView.InsertionMark.Index != index || _listView.InsertionMark.AppearsAfterItem != after)
+        {
+            _listView.InsertionMark.Index = index;
+            _listView.InsertionMark.AppearsAfterItem = after;
+            _listView.Invalidate();
+        }
+    }
+
+    // ---- 自绘列表：序号在缩略图前面 ----
+
+    private void OnListDrawItem(object? sender, DrawListViewItemEventArgs e)
+    {
+        // 一次性自绘整行，避免 OwnerDraw 下背景与文字分属两个事件、部分重绘时漏画文字
+        var g = e.Graphics;
+        bool sel = e.Item.Selected;
+        var bg = sel ? SystemColors.Highlight : _listView.BackColor;
+        using (var brush = new SolidBrush(bg))
+            g.FillRectangle(brush, e.Bounds);
+
+        var textColor = sel ? SystemColors.HighlightText : _listView.ForeColor;
+        int left = e.Bounds.Left;
+
+        // 第 1 列：序号（左）+ 缩略图（右）
+        const int numWidth = 36;
+        var numRect = new Rectangle(left, e.Bounds.Top, numWidth, e.Bounds.Height);
+        TextRenderer.DrawText(g, e.Item.Text, _listView.Font, numRect, textColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+
+        if (e.Item.ImageIndex >= 0 && e.Item.ImageIndex < _thumbList.Images.Count)
+        {
+            // Images[索引] 返回的是 HIMAGELIST 的副本，必须用完即释放，否则每次重绘都泄漏一个位图
+            using var img = _thumbList.Images[e.Item.ImageIndex];
+            int x = left + numWidth + (_listView.Columns[0].Width - numWidth - img.Width) / 2;
+            int y = e.Bounds.Top + (e.Bounds.Height - img.Height) / 2;
+            g.DrawImage(img, x, y);
+        }
+        left += _listView.Columns[0].Width;
+
+        // 第 2 列：文件名
+        TextRenderer.DrawText(g, e.Item.SubItems[1].Text, _listView.Font,
+            new Rectangle(left, e.Bounds.Top, _listView.Columns[1].Width, e.Bounds.Height), textColor,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        left += _listView.Columns[1].Width;
+
+        // 第 3 列：尺寸
+        TextRenderer.DrawText(g, e.Item.SubItems[2].Text, _listView.Font,
+            new Rectangle(left, e.Bounds.Top, _listView.Columns[2].Width, e.Bounds.Height), textColor,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
     }
 
     private void RemoveSelected()
@@ -319,7 +523,7 @@ public sealed class MainForm : Form
     {
         if (_listView.Columns.Count < 3) return;
         int total = Math.Max(0, _listView.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4);
-        int seq = Math.Min(40, total);
+        int seq = Math.Min(90, total);
         int rest = Math.Max(0, total - seq);
         _listView.Columns[1].Width = rest / 2;
         _listView.Columns[2].Width = rest - rest / 2;
@@ -353,18 +557,23 @@ public sealed class MainForm : Form
             var old0 = _picPreview.Image;
             _picPreview.Image = null;
             old0?.Dispose();
+            _picPreview.ResetView();
             _lblHint.Visible = true;
             _lblStatus.Text = "就绪";
+            // 已标记删除的缩略图此时都已 Dispose，再触发终结器回收历史泄漏的位图，让内存回落
+            ReclaimMemory();
             return;
         }
         _lblHint.Visible = false;
 
         var items = _items.ToList();
         bool vertical = _rbVertical.Checked;
-        var task = Task.Run(() => StitchEngine.RenderPreview(items, vertical));
+        var layout = StitchEngine.ComputeLayout(items, vertical);
+        var task = Task.Run(() => StitchEngine.RenderPreviewWithEstimate(items, vertical, layout.Canvas));
         _renderTask = task;
         Bitmap bmp;
-        try { bmp = await task; }
+        long estimatedBytes;
+        try { (bmp, estimatedBytes) = await task; }
         catch (Exception ex)
         {
             if (ver == _refreshVersion) _lblStatus.Text = "预览失败：" + ex.Message;
@@ -375,10 +584,63 @@ public sealed class MainForm : Form
         var old = _picPreview.Image;
         _picPreview.Image = bmp;
         old?.Dispose();
+        _picPreview.ResetView();
 
-        var layout = StitchEngine.ComputeLayout(items, vertical);
+        long? limit = null;
+        try { limit = ParseLimitBytes(); } catch (FormatException) { /* 输入无效时按不限制处理 */ }
+
+        string volumeText = limit is { } lim && estimatedBytes > lim
+            ? $"预计体积约 {lim / 1024.0 / 1024.0:F2} MB（已达体积上限，将自动压缩）"
+            : $"预计体积约 {estimatedBytes / 1024.0 / 1024.0:F2} MB（JPG）";
+
         _lblStatus.Text = $"共 {items.Count} 张图片，输出尺寸 {layout.Canvas.Width}×{layout.Canvas.Height}" +
-                          (layout.Clamped ? "（已因超出尺寸上限自动缩小）" : "");
+                          (layout.Clamped ? "（已因超出尺寸上限自动缩小）" : "") +
+                          $" | {volumeText}";
+    }
+
+    // ---- 预览缩放/平移 ----
+
+    private void OnPreviewMouseWheel(object? sender, MouseEventArgs e)
+    {
+        if (_picPreview.Image == null) return;
+        _picPreview.ZoomAt(e.Location, e.Delta > 0 ? 1.25f : 1f / 1.25f);
+    }
+
+    private void OnPreviewMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || _picPreview.Image == null) return;
+        _previewDragging = true;
+        _lastMouse = e.Location;
+        _picPreview.Cursor = Cursors.SizeAll;
+    }
+
+    private void OnPreviewMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (!_previewDragging) return;
+        _picPreview.PanBy(new PointF(e.X - _lastMouse.X, e.Y - _lastMouse.Y));
+        _lastMouse = e.Location;
+    }
+
+    private void OnPreviewMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (!_previewDragging) return;
+        _previewDragging = false;
+        _picPreview.Cursor = Cursors.Default;
+    }
+
+    // 体积上限输入变化后防抖刷新，让预测跟随限制更新
+    private async void OnLimitTextChanged(object? sender, EventArgs e)
+    {
+        _limitCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _limitCts = cts;
+        try
+        {
+            await Task.Delay(500, cts.Token);
+            if (!cts.IsCancellationRequested && !IsDisposed)
+                RefreshPreview();
+        }
+        catch (TaskCanceledException) { }
     }
 
     // ================= 保存 =================
@@ -417,6 +679,7 @@ public sealed class MainForm : Form
 
         var items = _items.ToList();
         bool vertical = _rbVertical.Checked;
+        var mode = _cbxMode.SelectedIndex == 1 ? StitchEngine.RenderMode.Parallel : StitchEngine.RenderMode.Normal;
 
         SetBusy(true, "正在合成…");
         _progress.Visible = true;
@@ -429,22 +692,39 @@ public sealed class MainForm : Form
         });
         void Status(string s) => BeginInvoke(() => _lblStatus.Text = s);
 
+        SavePlan? plan = null;
         try
         {
-            var result = await Task.Run(() =>
+            plan = await Task.Run(() =>
             {
-                using var bmp = StitchEngine.RenderFull(items, vertical, progress);
-                return StitchEngine.Save(bmp, path, asPng, limit, Status);
+                using var bmp = StitchEngine.RenderFull(items, vertical, progress, mode);
+                return StitchEngine.CreatePlan(bmp, path, asPng, limit, Status);
             });
+            if (IsDisposed) return;
 
             var notes = new List<string>();
-            if (result.ConvertedToJpg) notes.Add("PNG 超出体积上限，已自动改存为 JPG");
-            if (result.Downscaled) notes.Add("已自动缩小分辨率以满足体积上限");
-            string msg = $"保存成功！\n\n文件：{result.FinalPath}\n格式：{result.Format}" +
-                         (result.Format == "JPG" ? $"（质量 {result.Quality}）" : "") +
-                         $"\n尺寸：{result.FinalSize.Width}×{result.FinalSize.Height}" +
-                         $"\n大小：{result.Bytes / 1024.0 / 1024.0:F2} MB" +
+            if (plan.Meta.ConvertedToJpg) notes.Add("PNG 超出体积上限，将自动改存为 JPG");
+            if (plan.Meta.Downscaled) notes.Add("将自动缩小分辨率以满足体积上限");
+            string est = $"预计体积：{plan.Meta.Bytes / 1024.0 / 1024.0:F2} MB\n" +
+                         $"格式：{plan.Meta.Format}" +
+                         (plan.Meta.Format == "JPG" ? $"（质量 {plan.Meta.Quality}）" : "") +
+                         $"\n尺寸：{plan.Meta.FinalSize.Width}×{plan.Meta.FinalSize.Height}" +
+                         (notes.Count > 0 ? "\n\n" + string.Join("\n", notes) : "") +
+                         "\n\n是否保存？";
+            if (MessageBox.Show(this, est, "确认保存", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            {
+                _lblStatus.Text = "取消保存，合成文件已丢弃";
+                return;
+            }
+
+            // 先把消息内容取出来；写完文件后立即释放数百 MB 的字节数组，再弹“保存成功”框
+            string msg = $"保存成功！\n\n文件：{plan.Meta.FinalPath}\n格式：{plan.Meta.Format}" +
+                         (plan.Meta.Format == "JPG" ? $"（质量 {plan.Meta.Quality}）" : "") +
+                         $"\n尺寸：{plan.Meta.FinalSize.Width}×{plan.Meta.FinalSize.Height}" +
+                         $"\n大小：{plan.Meta.Bytes / 1024.0 / 1024.0:F2} MB" +
                          (notes.Count > 0 ? "\n\n" + string.Join("\n", notes) : "");
+            File.WriteAllBytes(plan.Meta.FinalPath, plan.Data);
+            plan = null; // 大 byte[] 尽早失去引用，用户停留在提示框时也能被回收
             _lblStatus.Text = "保存完成";
             MessageBox.Show(this, msg, "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -457,6 +737,8 @@ public sealed class MainForm : Form
         {
             _progress.Visible = false;
             SetBusy(false);
+            // 强制回收合成产生的画布与大字节数组（可能数百 MB），让内存峰值尽快回落
+            ReclaimMemory();
         }
     }
 
@@ -466,6 +748,7 @@ public sealed class MainForm : Form
         _menu.Enabled = !busy;
         _rbVertical.Enabled = _rbHorizontal.Enabled = !busy;
         _txtLimit.Enabled = !busy;
+        _cbxMode.Enabled = !busy;
         _listView.Enabled = !busy;
         AllowDrop = !busy;
         if (busy)
@@ -480,4 +763,87 @@ public sealed class MainForm : Form
             UpdateButtons();
         }
     }
+
+    // ================= 渲染模式指示 =================
+
+    private void UpdateModeIndicator()
+    {
+        if (_cbxMode.SelectedIndex == 1)
+        {
+            var (cores, threads) = CpuInfo.Value;
+            _lblCpu.Text = $"并行：{cores} 核 / {threads} 线程";
+        }
+        else
+        {
+            _lblCpu.Text = "普通：串行";
+        }
+    }
+
+    /// <summary>每秒刷新一次，显示当前进程占用内存。</summary>
+    private void UpdateMemText()
+    {
+        long bytes = Environment.WorkingSet;
+        _lblMem.Text = $"内存 {bytes / 1024.0 / 1024.0:F0} MB";
+    }
+
+    /// <summary>强制执行终结器并回收，释放带终结器的 GDI+ 位图、LOH 大数组等，让进程内存尽快回落。</summary>
+    private void ReclaimMemory()
+    {
+        GC.Collect(2, GCCollectionMode.Forced, true); // 全代收集 + 压缩 LOH，回收几百 MB 的大数组
+        GC.WaitForPendingFinalizers();
+        GC.Collect(2, GCCollectionMode.Forced, true);
+    }
+
+    private static readonly Lazy<(int Cores, int Threads)> CpuInfo = new(QueryCpuInfo);
+
+    /// <summary>通过 GetLogicalProcessorInformation 统计物理核心与逻辑线程；失败时回退到 Environment.ProcessorCount。</summary>
+    private static (int Cores, int Threads) QueryCpuInfo()
+    {
+        try
+        {
+            int len = 0;
+            GetLogicalProcessorInformation(IntPtr.Zero, ref len); // 失败返回 ERROR_INSUFFICIENT_BUFFER，len 为所需大小
+            var buffer = Marshal.AllocHGlobal(len);
+            try
+            {
+                GetLogicalProcessorInformation(buffer, ref len);
+                int size = Marshal.SizeOf<SystemLogicalProcessorInformation>();
+                int count = len / size;
+                int cores = 0, threads = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    var info = Marshal.PtrToStructure<SystemLogicalProcessorInformation>(buffer + i * size);
+                    int bits = BitOperations.PopCount(info.ProcessorMask);
+                    if (info.Relationship == RelationProcessorCore)
+                    {
+                        cores++;
+                        threads += bits;
+                    }
+                }
+                if (cores > 0 && threads > 0) return (cores, threads);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        catch { }
+        int logical = Environment.ProcessorCount;
+        return (logical, logical);
+    }
+
+    private const int RelationProcessorCore = 0;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SystemLogicalProcessorInformation
+    {
+        public nuint ProcessorMask;
+        public int Relationship;
+        private readonly int _pad;
+        private readonly ulong _reserved0;
+        private readonly ulong _reserved1;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern bool GetLogicalProcessorInformation(IntPtr buffer, ref int returnLength);
 }

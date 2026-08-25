@@ -36,6 +36,9 @@ public sealed record SaveResult(
     string FinalPath, string Format, int Quality,
     Size FinalSize, long Bytes, bool ConvertedToJpg, bool Downscaled);
 
+/// <summary>最终编码结果：字节数据 + 元信息（写文件由调用方负责）。</summary>
+public sealed record SavePlan(byte[] Data, SaveResult Meta);
+
 public static class StitchEngine
 {
     // GDI+ 单边尺寸上限
@@ -107,56 +110,130 @@ public static class StitchEngine
         return bmp;
     }
 
-    /// <summary>全分辨率合成：逐张加载原图、绘制后立即释放，控制内存峰值。</summary>
-    public static Bitmap RenderFull(IReadOnlyList<ImageItem> items, bool vertical, IProgress<(int done, int total)>? progress = null)
+    public enum RenderMode { Normal, Parallel }
+
+    /// <summary>全分辨率合成。普通模式逐张解码+绘制（内存友好）；并行模式多核解码（更快，内存峰值略高）。</summary>
+    public static Bitmap RenderFull(IReadOnlyList<ImageItem> items, bool vertical, IProgress<(int done, int total)>? progress = null, RenderMode mode = RenderMode.Normal)
     {
         var layout = ComputeLayout(items, vertical);
         var bmp = new Bitmap(layout.Canvas.Width, layout.Canvas.Height, PixelFormat.Format24bppRgb);
         using var g = CreateGraphics(bmp);
-        for (int i = 0; i < items.Count; i++)
+        try
         {
-            using (var src = LoadBitmap(items[i].FilePath))
-                DrawScaled(g, src, layout.Rects[i]);
-            progress?.Report((i + 1, items.Count));
+            if (mode == RenderMode.Parallel)
+                RenderParallel(g, items, layout, progress);
+            else
+                RenderSequential(g, items, layout, progress);
+            return bmp;
         }
-        return bmp;
+        catch
+        {
+            // 合成中途失败也要释放画布，避免大位图滞留
+            bmp.Dispose();
+            throw;
+        }
     }
 
-    public static SaveResult Save(Bitmap bmp, string path, bool asPng, long? limitBytes, Action<string>? status = null)
+    private static void RenderSequential(Graphics g, IReadOnlyList<ImageItem> items, LayoutResult layout, IProgress<(int done, int total)>? progress)
+    {
+        for (int i = 0; i < items.Count; i++)
+        {
+            using var src = LoadBitmap(items[i].FilePath);
+            DrawScaled(g, src, layout.Rects[i]);
+            progress?.Report((i + 1, items.Count));
+        }
+    }
+
+    private static void RenderParallel(Graphics g, IReadOnlyList<ImageItem> items, LayoutResult layout, IProgress<(int done, int total)>? progress)
+    {
+        int batch = Math.Max(1, Environment.ProcessorCount * 2);
+        var parallel = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
+        for (int start = 0; start < items.Count; start += batch)
+        {
+            int count = Math.Min(batch, items.Count - start);
+            var srcs = new Bitmap[count];
+            try
+            {
+                Parallel.For(0, count, parallel, j => srcs[j] = LoadBitmap(items[start + j].FilePath));
+                for (int j = 0; j < count; j++)
+                {
+                    DrawScaled(g, srcs[j], layout.Rects[start + j]);
+                    progress?.Report((start + j + 1, items.Count));
+                }
+            }
+            finally
+            {
+                // 无论正常还是解码中途抛异常，本批已解码的位图都必须释放
+                foreach (var b in srcs) b?.Dispose();
+            }
+        }
+    }
+
+    /// <summary>编码生成最终字节数据（不写文件），便于先展示预计体积再保存。</summary>
+    public static SavePlan CreatePlan(Bitmap bmp, string path, bool asPng, long? limitBytes, Action<string>? status = null)
     {
         if (asPng)
         {
             if (limitBytes is null)
             {
-                bmp.Save(path, ImageFormat.Png);
-                return new SaveResult(path, "PNG", 100, bmp.Size, new FileInfo(path).Length, false, false);
+                using var ms = new MemoryStream();
+                bmp.Save(ms, ImageFormat.Png);
+                var data = ms.ToArray();
+                return new SavePlan(data, new SaveResult(path, "PNG", 100, bmp.Size, data.LongLength, false, false));
             }
 
             status?.Invoke("正在编码 PNG…");
-            using var ms = new MemoryStream();
-            bmp.Save(ms, ImageFormat.Png);
-            if (ms.Length <= limitBytes)
+            using var ms2 = new MemoryStream();
+            bmp.Save(ms2, ImageFormat.Png);
+            if (ms2.Length <= limitBytes)
             {
-                File.WriteAllBytes(path, ms.ToArray());
-                return new SaveResult(path, "PNG", 100, bmp.Size, ms.Length, false, false);
+                var data = ms2.ToArray();
+                return new SavePlan(data, new SaveResult(path, "PNG", 100, bmp.Size, data.LongLength, false, false));
             }
             // PNG 超限，自动转 JPG 压缩
             path = Path.ChangeExtension(path, ".jpg");
-            var r = SaveJpegWithLimit(bmp, path, limitBytes.Value, status);
-            return r with { ConvertedToJpg = true };
+            var (jpegData, jpegMeta) = SaveJpegWithLimit(bmp, path, limitBytes.Value, status);
+            return new SavePlan(jpegData, jpegMeta with { ConvertedToJpg = true });
         }
 
         if (limitBytes is null)
         {
             var bytes = EncodeJpeg(bmp, DefaultQuality);
-            File.WriteAllBytes(path, bytes);
-            return new SaveResult(path, "JPG", DefaultQuality, bmp.Size, bytes.LongLength, false, false);
+            return new SavePlan(bytes, new SaveResult(path, "JPG", DefaultQuality, bmp.Size, bytes.LongLength, false, false));
         }
-        return SaveJpegWithLimit(bmp, path, limitBytes.Value, status);
+        var (data2, meta2) = SaveJpegWithLimit(bmp, path, limitBytes.Value, status);
+        return new SavePlan(data2, meta2);
+    }
+
+    /// <summary>渲染预览图，并对高分辨率采样图编码，按幂律外推全尺寸 JPG 体积（自适应内容复杂度/清晰度）。</summary>
+    public static (Bitmap preview, long estimate) RenderPreviewWithEstimate(
+        IReadOnlyList<ImageItem> items, bool vertical, Size fullCanvas,
+        int previewMaxSide = 1600, int sampleMaxSide = 3200)
+    {
+        var preview = RenderPreview(items, vertical, previewMaxSide);
+        int fullSide = Math.Max(fullCanvas.Width, fullCanvas.Height);
+        int sampleSide = Math.Min(sampleMaxSide, fullSide);
+        long lowBytes = EncodeJpeg(preview, DefaultQuality).LongLength;
+
+        // 全尺寸接近或等于预览尺寸：预览图即全尺寸，估算直接准确
+        if (sampleSide <= previewMaxSide)
+            return (preview, lowBytes);
+
+        long highBytes;
+        using (var sample = RenderPreview(items, vertical, sampleSide))
+            highBytes = EncodeJpeg(sample, DefaultQuality).LongLength;
+
+        // JPG 体积 ∝ 边长^β，β 由两个采样点拟合，外推到全尺寸；越清晰/细节越多 β 越大
+        double beta = 1.0;
+        if (lowBytes > 0 && highBytes > lowBytes)
+            beta = Math.Log((double)highBytes / lowBytes) / Math.Log((double)sampleSide / previewMaxSide);
+        if (double.IsNaN(beta) || beta < 0.8 || beta > 2.5) beta = 1.5;
+        long est = (long)(highBytes * Math.Pow((double)fullSide / sampleSide, beta));
+        return (preview, est);
     }
 
     /// <summary>先质量二分（95→60），仍超限则等比缩小分辨率重试。</summary>
-    private static SaveResult SaveJpegWithLimit(Bitmap original, string path, long limit, Action<string>? status)
+    private static (byte[] data, SaveResult meta) SaveJpegWithLimit(Bitmap original, string path, long limit, Action<string>? status)
     {
         Bitmap cur = original;
         bool downscaled = false;
@@ -178,16 +255,12 @@ public static class StitchEngine
                         if (data.LongLength <= limit) { bestQ = mid; best = data; lo = mid + 1; }
                         else hi = mid - 1;
                     }
-                    File.WriteAllBytes(path, best);
-                    return new SaveResult(path, "JPG", bestQ, cur.Size, best.LongLength, false, downscaled);
+                    return (best, new SaveResult(path, "JPG", bestQ, cur.Size, best.LongLength, false, downscaled));
                 }
 
                 int longSide = Math.Max(cur.Width, cur.Height);
                 if (longSide <= 200)
-                {
-                    File.WriteAllBytes(path, atMin);
-                    return new SaveResult(path, "JPG", MinQuality, cur.Size, atMin.LongLength, false, downscaled);
-                }
+                    return (atMin, new SaveResult(path, "JPG", MinQuality, cur.Size, atMin.LongLength, false, downscaled));
 
                 double f = Math.Sqrt(limit / (double)atMin.LongLength) * 0.95;
                 int newSide = Math.Max(200, (int)(longSide * Math.Min(f, 0.9)));
@@ -237,6 +310,17 @@ public static class StitchEngine
 
     private static void DrawScaled(Graphics g, Image src, Rectangle dest)
     {
+        // 拼接常见等宽/等高场景：尺寸相同或无/微缩放时走快速绘制路径，避免高质量插值开销
+        if (dest.Width == src.Width && dest.Height == src.Height)
+        {
+            g.DrawImageUnscaled(src, dest.Location);
+            return;
+        }
+        if (Math.Abs(dest.Width - src.Width) <= 2 && Math.Abs(dest.Height - src.Height) <= 2)
+        {
+            g.DrawImage(src, dest);
+            return;
+        }
         // TileFlipXY 避免高质量插值在图片边缘产生半透明缝隙
         using var attr = new ImageAttributes();
         attr.SetWrapMode(WrapMode.TileFlipXY);
