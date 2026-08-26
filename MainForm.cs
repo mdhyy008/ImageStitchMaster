@@ -6,7 +6,12 @@ namespace ImageStitchMaster;
 
 public sealed class MainForm : Form
 {
-    private static readonly string[] SupportedExts = { ".jpg", ".jpeg", ".png", ".bmp" };
+    private static readonly string[] SupportedExts =
+    {
+        ".jpg", ".jpeg", ".png", ".bmp",
+        ".gif", ".tif", ".tiff", ".ico", ".emf", ".wmf",
+        ".webp", ".heic", ".heif"
+    };
 
     private readonly List<ImageItem> _items = new();
     private readonly List<ImageItem> _trash = new();
@@ -38,6 +43,7 @@ public sealed class MainForm : Form
     private bool _previewDragging;
     private Point _lastMouse;
     private CancellationTokenSource? _limitCts;
+    private ImageItem? _baseItem;
 
     public MainForm()
     {
@@ -77,12 +83,28 @@ public sealed class MainForm : Form
                 "合成时原图逐张加载、绘制后立即释放，内存峰值主要取决于画布本身。\n" +
                 "常见场景（手机截图拼长图）远达不到上述限制，可放心使用。",
                 "尺寸限制说明", MessageBoxButtons.OK, MessageBoxIcon.Information)));
-        miHelp.DropDownItems.Add(new ToolStripMenuItem("关于(&A)", null, (_, _) =>
+        miHelp.DropDownItems.Add(new ToolStripMenuItem("格式支持说明(&F)", null, (_, _) =>
             MessageBox.Show(this,
-                "X图片拼接 v1.0.1\n\n" +
+                "支持的图片格式：\n" +
+                "· JPG / JPEG、PNG、BMP（直接使用）\n" +
+                "· GIF、TIFF、ICO、EMF、WMF、WebP、HEIC / HEIF（自动转换）\n\n" +
+                "转换规则：\n" +
+                "1. 导入时，非 JPG 格式会自动转成 JPG 再用于拼接。\n" +
+                "2. 多帧格式（如 GIF）只取第一帧。\n" +
+                "3. 透明区域会填充为白色。\n" +
+                "4. 转换只在本软件内部进行，不会修改你的原图。\n" +
+                "5. WebP / HEIC 依赖系统解码器，无法解码的文件导入时会被跳过并提示。",
+                "格式支持说明", MessageBoxButtons.OK, MessageBoxIcon.Information)));
+        miHelp.DropDownItems.Add(new ToolStripMenuItem("关于(&A)", null, (_, _) =>
+        {
+            var ver = typeof(MainForm).Assembly.GetName().Version;
+            string v = ver == null ? "" : $"v{ver.Major}.{ver.Minor}.{ver.Build}";
+            MessageBox.Show(this,
+                $"X图片拼接 {v}\n\n" +
                 "支持横向/竖向拼接多张图片，可限制输出体积。\n\n" +
                 "开发者：明灯花月夜\n网址：mdhyy.cn",
-                "关于", MessageBoxButtons.OK, MessageBoxIcon.Information)));
+                "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }));
         _menu.Items.AddRange(new ToolStripItem[] { miFile, miHelp });
         MainMenuStrip = _menu;
 
@@ -166,6 +188,16 @@ public sealed class MainForm : Form
         _listView.Columns.Add("#", 90);
         _listView.Columns.Add("文件名", 150);
         _listView.Columns.Add("尺寸", 100);
+        _listView.Columns.Add("基准", 50);
+        _listView.MouseUp += OnListMouseUp;
+        var miSetBase = new ToolStripMenuItem("设为基准");
+        var miAutoBase = new ToolStripMenuItem("恢复自动（取最大）");
+        miSetBase.Click += (_, _) => SetBaseFromSelection();
+        miAutoBase.Click += (_, _) => { _baseItem = null; RefreshList(); RefreshPreview(); };
+        var listMenu = new ContextMenuStrip();
+        listMenu.Items.Add(miSetBase);
+        listMenu.Items.Add(miAutoBase);
+        _listView.ContextMenuStrip = listMenu;
         // 列宽跟随左面板宽度，文件名/尺寸各占剩余一半
         _listView.Resize += (_, _) => UpdateListColumnWidths();
         _listView.SelectedIndexChanged += (_, _) => UpdateButtons();
@@ -246,7 +278,7 @@ public sealed class MainForm : Form
         using var dlg = new OpenFileDialog
         {
             Title = "选择要拼接的图片",
-            Filter = "图片文件|*.jpg;*.jpeg;*.png;*.bmp|所有文件|*.*",
+            Filter = "图片文件|*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff;*.ico;*.emf;*.wmf;*.webp;*.heic;*.heif|所有文件|*.*",
             Multiselect = true
         };
         if (dlg.ShowDialog(this) == DialogResult.OK)
@@ -324,6 +356,7 @@ public sealed class MainForm : Form
             var lvi = new ListViewItem((i + 1).ToString()) { ImageIndex = i, Tag = it };
             lvi.SubItems.Add(it.FileName);
             lvi.SubItems.Add($"{it.Width}×{it.Height}");
+            lvi.SubItems.Add(it == _baseItem ? "基准" : "");
             _listView.Items.Add(lvi);
         }
         _listView.EndUpdate();
@@ -493,6 +526,16 @@ public sealed class MainForm : Form
         TextRenderer.DrawText(g, e.Item.SubItems[2].Text, _listView.Font,
             new Rectangle(left, e.Bounds.Top, _listView.Columns[2].Width, e.Bounds.Height), textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        left += _listView.Columns[2].Width;
+
+        // 第 4 列：基准（高亮显示当前以哪张图为准）
+        if (e.Item.SubItems.Count > 3 && e.Item.SubItems[3].Text.Length > 0)
+        {
+            TextRenderer.DrawText(g, "基准", _listView.Font,
+                new Rectangle(left, e.Bounds.Top, _listView.Columns[3].Width, e.Bounds.Height),
+                Color.FromArgb(0, 120, 215),
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
     }
 
     private void RemoveSelected()
@@ -519,14 +562,37 @@ public sealed class MainForm : Form
         RefreshPreview();
     }
 
+    // ---- 基准设置 ----
+
+    private void OnListMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right) return;
+        // 右键时选中被点中的行，使菜单作用于该行
+        var item = _listView.GetItemAt(e.X, e.Y);
+        if (item != null) item.Selected = true;
+    }
+
+    private void SetBaseFromSelection()
+    {
+        if (_listView.SelectedItems.Count == 0) return;
+        if (_listView.SelectedItems[0].Tag is ImageItem it)
+        {
+            _baseItem = it;
+            RefreshList();
+            RefreshPreview();
+        }
+    }
+
     private void UpdateListColumnWidths()
     {
-        if (_listView.Columns.Count < 3) return;
+        if (_listView.Columns.Count < 4) return;
         int total = Math.Max(0, _listView.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4);
         int seq = Math.Min(90, total);
-        int rest = Math.Max(0, total - seq);
+        int baseW = Math.Min(60, Math.Max(0, total - seq));
+        int rest = Math.Max(0, total - seq - baseW);
         _listView.Columns[1].Width = rest / 2;
         _listView.Columns[2].Width = rest - rest / 2;
+        _listView.Columns[3].Width = baseW;
     }
 
     private void UpdateButtons()
@@ -567,9 +633,10 @@ public sealed class MainForm : Form
         _lblHint.Visible = false;
 
         var items = _items.ToList();
+        if (_baseItem != null && !_items.Contains(_baseItem)) _baseItem = null;
         bool vertical = _rbVertical.Checked;
-        var layout = StitchEngine.ComputeLayout(items, vertical);
-        var task = Task.Run(() => StitchEngine.RenderPreviewWithEstimate(items, vertical, layout.Canvas));
+        var layout = StitchEngine.ComputeLayout(items, vertical, _baseItem);
+        var task = Task.Run(() => StitchEngine.RenderPreviewWithEstimate(items, vertical, layout.Canvas, baseItem: _baseItem));
         _renderTask = task;
         Bitmap bmp;
         long estimatedBytes;
@@ -674,8 +741,9 @@ public sealed class MainForm : Form
             FileName = "拼接_" + DateTime.Now.ToString("yyyyMMdd_HHmmss")
         };
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        bool asPng = dlg.FilterIndex == 2;
         string path = dlg.FileName;
+        // 格式来源：保存类型下拉框（默认 JPG）；文件名直接写 .png 扩展名时也按 PNG 处理，避免格式与扩展名不符
+        bool asPng = dlg.FilterIndex == 2 || path.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
 
         var items = _items.ToList();
         bool vertical = _rbVertical.Checked;
@@ -697,7 +765,7 @@ public sealed class MainForm : Form
         {
             plan = await Task.Run(() =>
             {
-                using var bmp = StitchEngine.RenderFull(items, vertical, progress, mode);
+                using var bmp = StitchEngine.RenderFull(items, vertical, progress, mode, _baseItem);
                 return StitchEngine.CreatePlan(bmp, path, asPng, limit, Status);
             });
             if (IsDisposed) return;

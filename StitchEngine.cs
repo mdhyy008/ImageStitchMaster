@@ -11,23 +11,43 @@ public sealed class ImageItem : IDisposable
     public int Width { get; }
     public int Height { get; }
     public Bitmap Thumbnail { get; }
+    private readonly string? _tempFile;
 
-    private ImageItem(string filePath, int width, int height, Bitmap thumbnail)
+    private ImageItem(string filePath, int width, int height, Bitmap thumbnail, string? tempFile = null)
     {
         FilePath = filePath;
         Width = width;
         Height = height;
         Thumbnail = thumbnail;
+        _tempFile = tempFile;
     }
 
     public static ImageItem Load(string filePath, int thumbMaxSide = 512)
     {
-        using var src = StitchEngine.LoadBitmap(filePath);
+        using var src = StitchEngine.LoadBitmapAny(filePath);
         var thumb = StitchEngine.Resize(src, thumbMaxSide);
-        return new ImageItem(filePath, src.Width, src.Height, thumb);
+        string stitchPath = filePath;
+        string? tempFile = null;
+        // 非 JPG 格式统一转存临时 JPG（多帧/特殊格式只取首帧，透明区填白），确保拼接时 GDI+ 可无障碍解码
+        string ext = Path.GetExtension(filePath).ToLowerInvariant();
+        if (ext != ".jpg" && ext != ".jpeg")
+        {
+            tempFile = Path.Combine(Path.GetTempPath(), $"imgstitch_{Guid.NewGuid():N}.jpg");
+            using (var jpg = StitchEngine.Resize(src, Math.Max(src.Width, src.Height)))
+                StitchEngine.SaveJpegFile(jpg, tempFile);
+            stitchPath = tempFile;
+        }
+        return new ImageItem(stitchPath, src.Width, src.Height, thumb, tempFile);
     }
 
-    public void Dispose() => Thumbnail.Dispose();
+    public void Dispose()
+    {
+        Thumbnail.Dispose();
+        if (_tempFile != null)
+        {
+            try { File.Delete(_tempFile); } catch { /* 忽略删除失败 */ }
+        }
+    }
 }
 
 public sealed record LayoutResult(Size Canvas, IReadOnlyList<Rectangle> Rects, bool Clamped);
@@ -55,11 +75,48 @@ public static class StitchEngine
         return new Bitmap(ms);
     }
 
-    public static LayoutResult ComputeLayout(IReadOnlyList<ImageItem> items, bool vertical)
+    /// <summary>GDI+ 解码优先；失败时（WebP/HEIC 等）回退到系统 WIC 解码。</summary>
+    public static Bitmap LoadBitmapAny(string path)
+    {
+        try { return LoadBitmap(path); }
+        catch { return DecodeViaWic(path); }
+    }
+
+    private static Bitmap DecodeViaWic(string path)
+    {
+        using var fs = File.OpenRead(path);
+        var decoder = System.Windows.Media.Imaging.BitmapDecoder.Create(
+            fs, System.Windows.Media.Imaging.BitmapCreateOptions.PreservePixelFormat,
+            System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+        if (decoder.Frames.Count == 0) throw new InvalidOperationException("无法解码图片");
+        // 多帧格式只取第一帧，经无损 PNG 流转成 GDI+ 位图
+        var frame = decoder.Frames[0];
+        using var ms = new MemoryStream();
+        var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+        encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(frame));
+        encoder.Save(ms);
+        ms.Position = 0;
+        return new Bitmap(ms);
+    }
+
+    public static void SaveJpegFile(Bitmap bmp, string path, int quality = DefaultQuality)
+    {
+        var codec = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == ImageFormat.Jpeg.Guid);
+        using var ep = new EncoderParameters(1);
+        ep.Param[0] = new EncoderParameter(Encoder.Quality, (long)quality);
+        bmp.Save(path, codec, ep);
+    }
+
+    public static LayoutResult ComputeLayout(IReadOnlyList<ImageItem> items, bool vertical, ImageItem? baseItem = null)
     {
         if (items.Count == 0) throw new ArgumentException("没有图片");
 
-        int baseSize = vertical ? items.Min(i => i.Width) : items.Min(i => i.Height);
+        // 基准边长：默认取宽度最大（竖拼）/ 高度最大（横拼）；也可由用户指定某张图为准
+        int baseSize;
+        if (baseItem != null && items.Contains(baseItem))
+            baseSize = vertical ? baseItem.Width : baseItem.Height;
+        else
+            baseSize = vertical ? items.Max(i => i.Width) : items.Max(i => i.Height);
         var lengths = items.Select(i => vertical
             ? (int)Math.Max(1, Math.Round(i.Height * (double)baseSize / i.Width))
             : (int)Math.Max(1, Math.Round(i.Width * (double)baseSize / i.Height))).ToArray();
@@ -91,21 +148,28 @@ public static class StitchEngine
     }
 
     /// <summary>用缓存缩略图快速合成预览（低内存）。</summary>
-    public static Bitmap RenderPreview(IReadOnlyList<ImageItem> items, bool vertical, int maxLongSide = 1600)
+    public static Bitmap RenderPreview(IReadOnlyList<ImageItem> items, bool vertical, int maxLongSide = 1600, ImageItem? baseItem = null)
     {
-        var layout = ComputeLayout(items, vertical);
+        var layout = ComputeLayout(items, vertical, baseItem);
         double f = Math.Min(1.0, maxLongSide / (double)Math.Max(layout.Canvas.Width, layout.Canvas.Height));
-        var size = new Size(Math.Max(1, (int)(layout.Canvas.Width * f)), Math.Max(1, (int)(layout.Canvas.Height * f)));
+        // 画布用向上取整，避免目标矩形四舍五入累加后超出画布导致边缘被裁
+        var size = new Size(
+            Math.Max(1, (int)Math.Ceiling(layout.Canvas.Width * f)),
+            Math.Max(1, (int)Math.Ceiling(layout.Canvas.Height * f)));
 
         var bmp = new Bitmap(size.Width, size.Height, PixelFormat.Format24bppRgb);
         using var g = CreateGraphics(bmp);
         for (int i = 0; i < items.Count; i++)
         {
             var r = layout.Rects[i];
-            var dest = new Rectangle(
-                (int)Math.Round(r.X * f), (int)Math.Round(r.Y * f),
-                Math.Max(1, (int)Math.Round(r.Width * f)), Math.Max(1, (int)Math.Round(r.Height * f)));
-            DrawScaled(g, items[i].Thumbnail, dest);
+            int x = (int)Math.Round(r.X * f);
+            int y = (int)Math.Round(r.Y * f);
+            int w = Math.Max(1, (int)Math.Round(r.Width * f));
+            int h = Math.Max(1, (int)Math.Round(r.Height * f));
+            // 夹到画布范围内，杜绝越界绘制
+            w = Math.Max(1, Math.Min(w, size.Width - x));
+            h = Math.Max(1, Math.Min(h, size.Height - y));
+            DrawScaled(g, items[i].Thumbnail, new Rectangle(x, y, w, h));
         }
         return bmp;
     }
@@ -113,9 +177,9 @@ public static class StitchEngine
     public enum RenderMode { Normal, Parallel }
 
     /// <summary>全分辨率合成。普通模式逐张解码+绘制（内存友好）；并行模式多核解码（更快，内存峰值略高）。</summary>
-    public static Bitmap RenderFull(IReadOnlyList<ImageItem> items, bool vertical, IProgress<(int done, int total)>? progress = null, RenderMode mode = RenderMode.Normal)
+    public static Bitmap RenderFull(IReadOnlyList<ImageItem> items, bool vertical, IProgress<(int done, int total)>? progress = null, RenderMode mode = RenderMode.Normal, ImageItem? baseItem = null)
     {
-        var layout = ComputeLayout(items, vertical);
+        var layout = ComputeLayout(items, vertical, baseItem);
         var bmp = new Bitmap(layout.Canvas.Width, layout.Canvas.Height, PixelFormat.Format24bppRgb);
         using var g = CreateGraphics(bmp);
         try
@@ -208,9 +272,9 @@ public static class StitchEngine
     /// <summary>渲染预览图，并对高分辨率采样图编码，按幂律外推全尺寸 JPG 体积（自适应内容复杂度/清晰度）。</summary>
     public static (Bitmap preview, long estimate) RenderPreviewWithEstimate(
         IReadOnlyList<ImageItem> items, bool vertical, Size fullCanvas,
-        int previewMaxSide = 1600, int sampleMaxSide = 3200)
+        int previewMaxSide = 1600, int sampleMaxSide = 3200, ImageItem? baseItem = null)
     {
-        var preview = RenderPreview(items, vertical, previewMaxSide);
+        var preview = RenderPreview(items, vertical, previewMaxSide, baseItem);
         int fullSide = Math.Max(fullCanvas.Width, fullCanvas.Height);
         int sampleSide = Math.Min(sampleMaxSide, fullSide);
         long lowBytes = EncodeJpeg(preview, DefaultQuality).LongLength;
@@ -220,7 +284,7 @@ public static class StitchEngine
             return (preview, lowBytes);
 
         long highBytes;
-        using (var sample = RenderPreview(items, vertical, sampleSide))
+        using (var sample = RenderPreview(items, vertical, sampleSide, baseItem))
             highBytes = EncodeJpeg(sample, DefaultQuality).LongLength;
 
         // JPG 体积 ∝ 边长^β，β 由两个采样点拟合，外推到全尺寸；越清晰/细节越多 β 越大
@@ -310,18 +374,7 @@ public static class StitchEngine
 
     private static void DrawScaled(Graphics g, Image src, Rectangle dest)
     {
-        // 拼接常见等宽/等高场景：尺寸相同或无/微缩放时走快速绘制路径，避免高质量插值开销
-        if (dest.Width == src.Width && dest.Height == src.Height)
-        {
-            g.DrawImageUnscaled(src, dest.Location);
-            return;
-        }
-        if (Math.Abs(dest.Width - src.Width) <= 2 && Math.Abs(dest.Height - src.Height) <= 2)
-        {
-            g.DrawImage(src, dest);
-            return;
-        }
-        // TileFlipXY 避免高质量插值在图片边缘产生半透明缝隙
+        // 与 v1.0.1 一致：TileFlipXY 让高质量插值在图边缘做镜像采样，避免拼接边界/放大时出现缝隙缺块
         using var attr = new ImageAttributes();
         attr.SetWrapMode(WrapMode.TileFlipXY);
         g.DrawImage(src, dest, 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attr);

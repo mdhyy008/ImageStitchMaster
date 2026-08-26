@@ -5,12 +5,18 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <AssemblyTitle>X图片拼接</AssemblyTitle>
     <Product>X图片拼接</Product>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WindowsDesktop SDK 的隐式 using 不含 System.IO，代码大量用到 File/Path/MemoryStream，需显式补充 -->
+    <Using Include="System.IO" />
+  </ItemGroup>
 
 </Project>
