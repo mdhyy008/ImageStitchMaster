@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -95,16 +96,7 @@ public sealed class MainForm : Form
                 "4. 转换只在本软件内部进行，不会修改你的原图。\n" +
                 "5. WebP / HEIC 依赖系统解码器，无法解码的文件导入时会被跳过并提示。",
                 "格式支持说明", MessageBoxButtons.OK, MessageBoxIcon.Information)));
-        miHelp.DropDownItems.Add(new ToolStripMenuItem("关于(&A)", null, (_, _) =>
-        {
-            var ver = typeof(MainForm).Assembly.GetName().Version;
-            string v = ver == null ? "" : $"v{ver.Major}.{ver.Minor}.{ver.Build}";
-            MessageBox.Show(this,
-                $"X图片拼接 {v}\n\n" +
-                "支持横向/竖向拼接多张图片，可限制输出体积。\n\n" +
-                "开发者：明灯花月夜\n网址：mdhyy.cn",
-                "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);
-        }));
+        miHelp.DropDownItems.Add(new ToolStripMenuItem("关于(&A)", null, (_, _) => ShowAbout()));
         _menu.Items.AddRange(new ToolStripItem[] { miFile, miHelp });
         MainMenuStrip = _menu;
 
@@ -860,6 +852,64 @@ public sealed class MainForm : Form
         GC.Collect(2, GCCollectionMode.Forced, true); // 全代收集 + 压缩 LOH，回收几百 MB 的大数组
         GC.WaitForPendingFinalizers();
         GC.Collect(2, GCCollectionMode.Forced, true);
+    }
+
+    private void ShowAbout()
+    {
+        var ver = typeof(MainForm).Assembly.GetName().Version;
+        string v = ver == null ? "" : $"v{ver.Major}.{ver.Minor}.{ver.Build}";
+
+        // 窗体随内容自适应宽高（高 DPI 下长链接也能完整显示），不设固定的 ClientSize；
+        // 不要用流式/表格布局——AutoSize 窗体里它们会把宽度塌缩到极小，导致内容被盖住
+        var dlg = new Form
+        {
+            Text = "关于",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BackColor = SystemColors.Control,
+            Font = new Font("Microsoft YaHei UI", 10F),
+        };
+
+        void AddAt(int x, int y, Control c) { c.Location = new Point(x, y); c.AutoSize = true; dlg.Controls.Add(c); }
+
+        AddAt(30, 20, new Label { Text = $"X图片拼接 {v}", Font = new Font("Microsoft YaHei UI", 14F, FontStyle.Bold) });
+        AddAt(30, 58, new Label { Text = "横向 / 竖向拼接多张图片，可限制输出体积" });
+        AddAt(30, 84, new Label { Text = "开发者：明灯花月夜" });
+        AddAt(30, 110, MakeLink("开发者主页：mdhyy.cn", "https://mdhyy.cn"));
+        AddAt(30, 136, MakeLink("开源地址：github.com/mdhyy008/ImageStitchMaster", "https://github.com/mdhyy008/ImageStitchMaster"));
+
+        // 先让 AutoSize 控件按文字内容定好尺寸，再据窗体实际客户区宽度放按钮
+        dlg.PerformLayout();
+        int contentBottom = dlg.Controls.Cast<Control>().Max(c => c.Bottom);
+        var ok = new Button { Text = "确定", Size = new Size(84, 32), DialogResult = DialogResult.OK };
+        ok.Location = new Point(dlg.ClientSize.Width - 16 - 84, contentBottom + 12);
+        dlg.Controls.Add(ok);
+        dlg.PerformLayout();
+        dlg.AcceptButton = ok;
+        dlg.ShowDialog(this);
+    }
+
+    private static LinkLabel MakeLink(string text, string url)
+    {
+        var link = new LinkLabel
+        {
+            Text = text,
+            AutoSize = true,
+            Tag = url,
+            LinkArea = new LinkArea(0, text.Length),
+            Margin = new Padding(0, 0, 0, 3),
+        };
+        link.LinkClicked += (_, _) =>
+        {
+            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+            catch { /* 忽略打开失败 */ }
+        };
+        return link;
     }
 
     private static readonly Lazy<(int Cores, int Threads)> CpuInfo = new(QueryCpuInfo);
